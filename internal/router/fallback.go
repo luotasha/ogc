@@ -3,7 +3,9 @@ package router
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"github.com/xynogen/ogc/internal/client"
 	"log/slog"
 	"strings"
 	"sync"
@@ -56,7 +58,7 @@ func (cb *CircuitBreaker) AllowRequest() bool {
 		// Check if recovery timeout has elapsed
 		if time.Since(cb.lastFailureTime) > cb.recoveryTimeout {
 			cb.state = CircuitHalfOpen
-			cb.halfOpenCalls = 0
+			cb.halfOpenCalls = 1
 			return true
 		}
 		return false
@@ -104,6 +106,15 @@ func (cb *CircuitBreaker) RecordFailure() {
 		if cb.failureCount >= cb.threshold {
 			cb.state = CircuitOpen
 		}
+	}
+}
+
+// RecordNeutral releases a probe without treating request-specific errors as an outage.
+func (cb *CircuitBreaker) RecordNeutral() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.state == CircuitHalfOpen && cb.halfOpenCalls > 0 {
+		cb.halfOpenCalls--
 	}
 }
 
@@ -173,8 +184,15 @@ func (h *FallbackHandler) ExecuteWithFallback(
 	executor func(context.Context, config.ModelConfig) ([]byte, error),
 ) (*FallbackResult, []byte, error) {
 	totalModels := len(models)
+	var lastErr error
+	if totalModels == 0 {
+		return nil, nil, fmt.Errorf("no models configured")
+	}
 
 	for i, model := range models {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		cb := h.getCircuitBreaker(model.ModelID)
 
 		// Skip models with open circuit breakers
@@ -208,7 +226,17 @@ func (h *FallbackHandler) ExecuteWithFallback(
 			}, body, nil
 		}
 
-		cb.RecordFailure()
+		lastErr = err
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			cb.RecordNeutral()
+			return nil, nil, err
+		}
+		var apiErr *client.APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 {
+			cb.RecordNeutral()
+		} else {
+			cb.RecordFailure()
+		}
 		h.logger.Warn("model failed, trying fallback",
 			"model", model.ModelID,
 			"error", err,
@@ -222,7 +250,7 @@ func (h *FallbackHandler) ExecuteWithFallback(
 		Success:     false,
 		Attempted:   totalModels,
 		TotalModels: totalModels,
-	}, nil, fmt.Errorf("all models failed (%d attempts)", totalModels)
+	}, nil, fmt.Errorf("all models failed (%d configured): %w", totalModels, lastError(lastErr))
 }
 
 // GetFallbackChain returns the fallback chain for a given primary model.
@@ -283,4 +311,11 @@ func (h *FallbackHandler) GetCircuitStates() map[string]string {
 		}
 	}
 	return states
+}
+
+func lastError(err error) error {
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("upstream temporarily unavailable: circuit breaker open")
 }

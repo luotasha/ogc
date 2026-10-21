@@ -22,8 +22,8 @@ type ChatCompletionRequest struct {
 // ChatMessage represents a single message in the conversation.
 type ChatMessage struct {
 	Role       string     `json:"role"`
-	Content    string     `json:"content,omitempty"`
-	Reasoning  string     `json:"reasoning,omitempty"`  // extended-thinking models (Kimi, DeepSeek R1)
+	Content    string     `json:"content"`
+	Reasoning  string     `json:"reasoning,omitempty"` // extended-thinking models (Kimi, DeepSeek R1)
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	Name       string     `json:"name,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`

@@ -2,15 +2,26 @@
 package config
 
 // Config holds the complete application configuration.
+type Account struct {
+	ID       string `json:"id"`
+	Name     string `json:"name,omitempty"`
+	APIKey   string `json:"api_key"`
+	Model    string `json:"model,omitempty"`
+	Disabled bool   `json:"disabled,omitempty"`
+}
+
 type Config struct {
-	APIKey       string                   `json:"api_key"`
-	Host         string                   `json:"host"`
-	Port         int                      `json:"port"`
-	Models       map[string]ModelConfig   `json:"models"`
-	Fallbacks    map[string][]ModelConfig `json:"fallbacks"`
-	Upstream     UpstreamConfig           `json:"upstream"`
-	Logging      LoggingConfig            `json:"logging"`
-	ModelMapping map[string]string        `json:"model_mapping"`
+	ConfigPath      string                   `json:"-"`
+	Accounts        []Account                `json:"accounts"`
+	SessionBindings string                   `json:"session_bindings"`
+	APIKey          string                   `json:"api_key"`
+	Host            string                   `json:"host"`
+	Port            int                      `json:"port"`
+	Models          map[string]ModelConfig   `json:"models"`
+	Fallbacks       map[string][]ModelConfig `json:"fallbacks"`
+	Upstream        UpstreamConfig           `json:"upstream"`
+	Logging         LoggingConfig            `json:"logging"`
+	ModelMapping    map[string]string        `json:"model_mapping"`
 }
 
 // ModelConfig defines routing rules for a specific model.

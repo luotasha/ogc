@@ -1,11 +1,13 @@
 package config
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -34,6 +36,7 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("loading config from %s: %w", configPath, err)
 	}
+	cfg.ConfigPath = configPath
 
 	applyEnvOverrides(cfg)
 	applyDefaults(cfg)
@@ -98,6 +101,21 @@ func interpolateEnvVars(s string) string {
 
 // applyEnvOverrides applies environment variable overrides to the config.
 func applyEnvOverrides(cfg *Config) {
+	if raw := os.Getenv("OGC_API_KEYS"); raw != "" {
+		cfg.Accounts = nil
+		for _, key := range strings.Split(raw, ",") {
+			key = strings.TrimSpace(key)
+			sum := sha256.Sum256([]byte(key))
+			cfg.Accounts = append(cfg.Accounts, Account{ID: fmt.Sprintf("key-%x", sum), APIKey: key})
+		}
+	}
+	if path := os.Getenv("OGC_SESSION_BINDINGS"); path != "" {
+		cfg.SessionBindings = path
+	}
+	if len(cfg.Accounts) > 0 && cfg.SessionBindings == "" {
+		cfg.SessionBindings = filepath.Join(filepath.Dir(resolveConfigPath()), "session-bindings.jsonl")
+	}
+
 	if v := os.Getenv("OGC_API_KEY"); v != "" {
 		cfg.APIKey = v
 	}
@@ -144,6 +162,39 @@ func applyDefaults(cfg *Config) {
 
 // validate checks that all required configuration fields are present.
 func validate(cfg *Config) error {
+	if len(cfg.Accounts) > 0 {
+		seen := map[string]bool{}
+		enabled := 0
+		modelIDs := make([]string, 0, len(cfg.Models))
+		for id := range cfg.Models {
+			modelIDs = append(modelIDs, id)
+		}
+		sort.Strings(modelIDs)
+		for i := range cfg.Accounts {
+			a := &cfg.Accounts[i]
+			if a.ID == "" || a.APIKey == "" || strings.Contains(a.APIKey, "${") || seen[a.ID] {
+				return fmt.Errorf("accounts require unique IDs and resolved nonempty keys")
+			}
+			if a.Model == "" && len(modelIDs) > 0 {
+				a.Model = modelIDs[0]
+			}
+			if _, ok := cfg.Models[a.Model]; !ok {
+				return fmt.Errorf("account %q references unknown model %q", a.ID, a.Model)
+			}
+			seen[a.ID] = true
+			if !a.Disabled {
+				enabled++
+			}
+		}
+		if enabled == 0 {
+			return fmt.Errorf("at least one account must be enabled")
+		}
+		if cfg.SessionBindings == "" {
+			return fmt.Errorf("session_bindings path is required for accounts")
+		}
+		cfg.SessionBindings = expandHome(cfg.SessionBindings)
+		return nil
+	}
 	if cfg.APIKey == "" {
 		return fmt.Errorf("api_key is required (set via config file or OGC_API_KEY env var)")
 	}

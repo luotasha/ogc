@@ -61,9 +61,23 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	mux := http.NewServeMux()
 
 	// API routes.
-	mux.HandleFunc("/v1/messages", messagesHandler.HandleMessages)
+	if len(cfg.Accounts) > 0 {
+		multi, err := newSessionRouter(cfg, tokenCounter, metrics, logger)
+		if err != nil {
+			return nil, err
+		}
+		mux.Handle("/v1/messages", multi)
+		mux.HandleFunc("/health", multi.Health)
+		mux.HandleFunc("/admin", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/admin/", http.StatusTemporaryRedirect)
+		})
+		mux.HandleFunc("/admin/", multi.Admin)
+		mux.HandleFunc("/admin/api/", multi.AdminAPI)
+	} else {
+		mux.HandleFunc("/v1/messages", messagesHandler.HandleMessages)
+		mux.HandleFunc("/health", healthHandler.HandleHealth)
+	}
 	mux.HandleFunc("/v1/messages/count_tokens", healthHandler.HandleCountTokens)
-	mux.HandleFunc("/health", healthHandler.HandleHealth)
 
 	// Create HTTP server.
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)

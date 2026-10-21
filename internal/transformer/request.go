@@ -143,9 +143,9 @@ func (t *RequestTransformer) transformUserMessage(blocks []types.ContentBlock) (
 		for _, p := range textParts {
 			text += p
 		}
-		// Prepend user text before tool results
+		// Tool results must immediately follow the assistant tool calls.
 		userMsg := types.ChatMessage{Role: "user", Content: text}
-		result = append([]types.ChatMessage{userMsg}, result...)
+		result = append(result, userMsg)
 	}
 
 	return result, nil

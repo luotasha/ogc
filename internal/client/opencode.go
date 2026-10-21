@@ -17,8 +17,8 @@ import (
 
 // Client handles communication with upstream API.
 type Client struct {
-	openAIConfig     EndpointConfig
-	anthropicConfig  EndpointConfig
+	openAIConfig    EndpointConfig
+	anthropicConfig EndpointConfig
 	httpClient      *http.Client
 }
 
@@ -79,6 +79,8 @@ func (c *Client) ChatCompletion(
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
+	setSessionHeaders(httpReq)
+
 	// Set headers
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+endpoint.APIKey)
@@ -97,7 +99,7 @@ func (c *Client) ChatCompletion(
 	if resp.StatusCode >= http.StatusBadRequest {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(bodyBytes), RequestID: resp.Header.Get("x-request-id")}
 	}
 
 	return resp, nil
@@ -175,6 +177,8 @@ func (c *Client) SendAnthropicRequest(
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
+	setSessionHeaders(httpReq)
+
 	// Set headers - x-api-key is required for OpenCode Go's /v1/messages endpoint
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("x-api-key", endpoint.APIKey)
@@ -194,7 +198,7 @@ func (c *Client) SendAnthropicRequest(
 	if resp.StatusCode >= http.StatusBadRequest {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(bodyBytes), RequestID: resp.Header.Get("x-request-id")}
 	}
 
 	return resp, nil

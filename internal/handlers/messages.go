@@ -4,6 +4,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -135,6 +136,12 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	userID := ""
+	if anthropicReq.Metadata != nil {
+		userID = anthropicReq.Metadata.UserID
+	}
+	r = r.WithContext(client.WithSession(r.Context(), r.Header, userID))
+
 	// Validate request
 	if err := anthropicReq.Validate(); err != nil {
 		h.sendError(w, http.StatusBadRequest, err.Error(), nil)
@@ -233,6 +240,7 @@ func (h *MessagesHandler) handleStreaming(
 	defer close(heartbeatDone)
 
 	streamStart := time.Now()
+	var lastUpstreamErr error
 
 	for _, model := range modelChain {
 		// Check if client already disconnected before trying this model
@@ -247,7 +255,7 @@ func (h *MessagesHandler) handleStreaming(
 
 		// Create a fresh context with timeout for THIS attempt only.
 		// Don't use r.Context() directly - it gets canceled when Claude Code retries.
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Minute)
 
 		if model.Provider == "anthropic" {
 			// For MiniMax models, send raw Anthropic request to Anthropic endpoint
@@ -285,6 +293,7 @@ func (h *MessagesHandler) handleStreaming(
 				h.logger.Info("client disconnected during upstream request")
 				return
 			}
+			lastUpstreamErr = err
 			h.logger.Warn("streaming request failed", "model", model.ModelID, "error", err)
 			continue
 		}
@@ -320,7 +329,11 @@ func (h *MessagesHandler) handleStreaming(
 		h.sendError(w, http.StatusBadGateway, "all streaming models failed", nil)
 	} else {
 		// Headers already sent - send error as SSE event
-		h.sendStreamError(rw, "all upstream models failed")
+		message := "all upstream models failed"
+		if lastUpstreamErr != nil {
+			message = lastUpstreamErr.Error()
+		}
+		h.sendStreamError(rw, message)
 	}
 }
 
@@ -469,8 +482,18 @@ func (h *MessagesHandler) handleNonStreaming(
 	)
 
 	if err != nil {
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			return
+		}
 		h.metrics.RecordFailure()
-		h.sendError(w, http.StatusBadGateway, "all models failed", err)
+		status := http.StatusBadGateway
+		message := "all models failed"
+		var apiErr *client.APIError
+		if errors.As(err, &apiErr) {
+			status = apiErr.StatusCode
+			message = apiErr.Error()
+		}
+		h.sendError(w, status, message, err)
 		return
 	}
 

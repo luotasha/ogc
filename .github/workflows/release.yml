@@ -1,248 +1,72 @@
-name: Release
+name: Build and Release
 
 on:
   push:
-    branches: [main]
+    branches: [main, "custom/**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  # ── Stage 1: Test & Build Validation ──────────────────────────────
-  validate:
-    name: Test & Build
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.21"
+          go-version: "1.25.x"
+          cache: true
+      - run: go test ./... -race
+      - run: go vet ./...
 
-      - name: Download dependencies
-        run: go mod download
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Test
-        run: go test ./... -v -race
-
-      - name: Build (sanity check)
-        run: go build -o /dev/null ./cmd/oc-go-cc
-
-  # ── Stage 2: Create Release ──────────────────────────────────────
-  release:
-    name: Create Release
-    needs: validate
+  build:
+    needs: test
     runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.version.outputs.tag }}
+    strategy:
+      matrix:
+        include:
+          - { os: darwin, arch: amd64, suffix: "" }
+          - { os: darwin, arch: arm64, suffix: "" }
+          - { os: linux, arch: amd64, suffix: "" }
+          - { os: linux, arch: arm64, suffix: "" }
+          - { os: windows, arch: amd64, suffix: ".exe" }
+          - { os: windows, arch: arm64, suffix: ".exe" }
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.21"
-
-      - name: Determine version
-        id: version
-        run: |
-          # Check if there's a tag on this commit
-          EXACT_TAG=$(git describe --tags --exact-match 2>/dev/null || echo "")
-          if [ -n "$EXACT_TAG" ]; then
-            TAG="$EXACT_TAG"
-          else
-            # Auto-increment patch version from the latest tag
-            LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-            BASE=${LATEST_TAG#v}
-            IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE"
-            PATCH=$((PATCH + 1))
-            TAG="v${MAJOR}.${MINOR}.${PATCH}"
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
-          echo "Releasing as $TAG"
-
-      - name: Build cross-platform binaries
+          go-version: "1.25.x"
+          cache: true
+      - name: Build both proxies
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
         run: |
           mkdir -p dist
-
-          LDFLAGS="-X main.version=${VERSION}"
-
-          # Define target platforms
-          declare -A TARGETS=(
-            ["darwin-amd64"]="darwin/amd64"
-            ["darwin-arm64"]="darwin/arm64"
-            ["linux-amd64"]="linux/amd64"
-            ["linux-arm64"]="linux/arm64"
-            ["windows-amd64"]="windows/amd64"
-            ["windows-arm64"]="windows/arm64"
-          )
-
-          for NAME in "${!TARGETS[@]}"; do
-            IFS='/' read -r GOOS GOARCH <<< "${TARGETS[$NAME]}"
-            EXT=""
-            [ "$GOOS" = "windows" ] && EXT=".exe"
-
-            echo "Building ${NAME}..."
-            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
-              go build -ldflags "$LDFLAGS -s -w" \
-                -o "dist/oc-go-cc_${NAME}${EXT}" \
-                ./cmd/oc-go-cc
-          done
-
-          echo ""
-          echo "Built binaries:"
-          ls -lh dist/
-
-      - name: Generate checksums
-        run: |
-          cd dist
-          sha256sum oc-go-cc_* > checksums.txt
-          cat checksums.txt
-
-      # GITHUB_TOKEN works here — same repo
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+          go build -trimpath -ldflags "-s -w" -o "dist/ogc_${GOOS}-${GOARCH}${{ matrix.suffix }}" ./cmd/ogc
+          go build -trimpath -ldflags "-s -w" -o "dist/ogc-reasoning-proxy_${GOOS}-${GOARCH}${{ matrix.suffix }}" ./cmd/ogc-reasoning-proxy
+      - uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: Release ${{ steps.version.outputs.tag }}
-          generate_release_notes: true
-          draft: false
-          prerelease: false
-          files: |
-            dist/oc-go-cc_*
-            dist/checksums.txt
+          name: binaries-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
 
-  # ── Stage 3: Update Homebrew Tap ─────────────────────────────────
-  homebrew:
-    name: Update Homebrew Tap
-    needs: release
-    if: github.repository == 'samueltuyizere/oc-go-cc'
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download release assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.release.outputs.tag }}
-        run: |
-          gh release download "$TAG" \
-            --repo "${{ github.repository }}" \
-            --dir release-assets \
-            --pattern "checksums.txt"
-
-      - name: Extract checksums for Homebrew
-        id: checksums
-        run: |
-          cd release-assets
-          DARWIN_ARM64=$(awk '/darwin-arm64$/ {print $1}' checksums.txt)
-          DARWIN_AMD64=$(awk '/darwin-amd64$/ {print $1}' checksums.txt)
-          LINUX_AMD64=$(awk '/linux-amd64$/ {print $1}' checksums.txt)
-          LINUX_ARM64=$(awk '/linux-arm64$/ {print $1}' checksums.txt)
-
-          echo "darwin_arm64=$DARWIN_ARM64" >> "$GITHUB_OUTPUT"
-          echo "darwin_amd64=$DARWIN_AMD64" >> "$GITHUB_OUTPUT"
-          echo "linux_amd64=$LINUX_AMD64" >> "$GITHUB_OUTPUT"
-          echo "linux_arm64=$LINUX_ARM64" >> "$GITHUB_OUTPUT"
-
-      # HOMEBREW_PAT needed here — cross-repo operations
-      - name: Update homebrew tap
-        env:
-          PAT: ${{ secrets.HOMEBREW_PAT }}
-          TAG: ${{ needs.release.outputs.tag }}
-          VERSION: ${{ needs.release.outputs.tag }}
-          DARWIN_ARM64: ${{ steps.checksums.outputs.darwin_arm64 }}
-          DARWIN_AMD64: ${{ steps.checksums.outputs.darwin_amd64 }}
-          LINUX_AMD64: ${{ steps.checksums.outputs.linux_amd64 }}
-          LINUX_ARM64: ${{ steps.checksums.outputs.linux_arm64 }}
-        run: |
-          REPO="${{ github.repository }}"
-          OWNER="${REPO%%/*}"
-          TAP_REPO="${OWNER}/homebrew-tap"
-          VERSION="${TAG#v}"
-          BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
-
-          # Clone the tap repo (created manually as a public repo)
-          git clone "https://x-access-token:${PAT}@github.com/${TAP_REPO}.git" tap-repo
-          cd tap-repo
-
-          mkdir -p Formula
-
-          cat > Formula/oc-go-cc.rb << RUBY
-          class OcGoCc < Formula
-            desc "Proxy Claude Code requests to OpenCode Go API"
-            homepage "https://github.com/${REPO}"
-            version "${VERSION}"
-
-            on_macos do
-              if Hardware::CPU.arm?
-                url "${BASE_URL}/oc-go-cc_darwin-arm64"
-                sha256 "${DARWIN_ARM64}"
-              else
-                url "${BASE_URL}/oc-go-cc_darwin-amd64"
-                sha256 "${DARWIN_AMD64}"
-              end
-            end
-
-            on_linux do
-              if Hardware::CPU.intel?
-                url "${BASE_URL}/oc-go-cc_linux-amd64"
-                sha256 "${LINUX_AMD64}"
-              else
-                url "${BASE_URL}/oc-go-cc_linux-arm64"
-                sha256 "${LINUX_ARM64}"
-              end
-            end
-
-            def install
-              if OS.mac? && Hardware::CPU.arm?
-                bin.install "oc-go-cc_darwin-arm64" => "oc-go-cc"
-              elsif OS.mac?
-                bin.install "oc-go-cc_darwin-amd64" => "oc-go-cc"
-              elsif OS.linux? && Hardware::CPU.intel?
-                bin.install "oc-go-cc_linux-amd64" => "oc-go-cc"
-              else
-                bin.install "oc-go-cc_linux-arm64" => "oc-go-cc"
-              end
-            end
-
-            def caveats
-              <<~EOS
-                To get started with oc-go-cc:
-
-                  1. Initialize configuration:
-                     ogc init
-
-                  2. Set your OpenCode Go API key:
-                     export OGC_API_KEY=sk-opencode-your-key
-
-                  3. Start the proxy:
-                     ogc serve
-
-                  4. Configure Claude Code:
-                     export ANTHROPIC_BASE_URL=http://127.0.0.1:3456
-                     export ANTHROPIC_AUTH_TOKEN=unused
-
-                  5. Run Claude Code:
-                     claude
-              EOS
-            end
-
-            test do
-              system "#{bin}/oc-go-cc", "--version"
-            end
-          end
-          RUBY
-
-          git add Formula/oc-go-cc.rb
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -m "Update oc-go-cc to ${VERSION}" || echo "No changes to commit"
-          git push
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: dist
+      - name: Generate checksums
+        run: cd dist && sha256sum * > checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*

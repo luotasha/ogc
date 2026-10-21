@@ -100,11 +100,15 @@ func serveCmd() *cobra.Command {
 			pidPath := getPIDPath()
 			if pid, err := daemon.GetPID(pidPath); err == nil {
 				// Check if process is still running.
-				if daemon.IsProcessRunning(pid) {
+				// In --_daemonize mode ForkIntoBackground already wrote this
+				// child's PID. Do not mistake the child for another server.
+				if pid != os.Getpid() && daemon.IsProcessRunning(pid) {
 					return fmt.Errorf("server is already running (PID %d)", pid)
 				}
-				// Stale PID file, clean up.
-				os.Remove(pidPath)
+				if pid != os.Getpid() {
+					// Stale PID file, clean up.
+					os.Remove(pidPath)
+				}
 			}
 
 			// Write PID file.
