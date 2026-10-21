@@ -106,6 +106,8 @@ type proxy struct {
 	cache  *reasoningCache
 }
 
+const missingReasoningFallback = "Reasoning unavailable because this tool call predates the local compatibility cache."
+
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -176,11 +178,20 @@ func (p *proxy) patchRequest(body []byte) ([]byte, int) {
 			continue
 		}
 		ids := toolCallIDs(msg["tool_calls"])
+		if len(ids) == 0 {
+			continue
+		}
 		if reasoning, ok := p.cache.get(ids); ok {
 			msg["reasoning_content"] = reasoning
-			injected++
-			changed = true
+		} else {
+			// Sessions created before the proxy was installed, or responses whose
+			// streamed tool-call IDs were fragmented by the provider, have no
+			// recoverable cache entry. OpenCode Go rejects those turns when the
+			// field is absent, but accepts a nonempty compatibility marker.
+			msg["reasoning_content"] = missingReasoningFallback
 		}
+		injected++
+		changed = true
 	}
 	if !changed {
 		return body, 0
@@ -210,12 +221,12 @@ func (p *proxy) forwardStream(w http.ResponseWriter, body io.Reader) {
 	reader := bufio.NewReader(body)
 	flusher, _ := w.(http.Flusher)
 	var reasoning strings.Builder
-	ids := map[string]bool{}
+	toolCalls := newStreamToolCalls()
 	complete := false
 	for {
 		line, err := reader.ReadString('\n')
 		if line != "" {
-			captureStreamLine(line, &reasoning, ids)
+			captureStreamLine(line, &reasoning, toolCalls)
 			complete = complete || streamCompleteLine(line)
 			_, _ = io.WriteString(w, line)
 			if flusher != nil {
@@ -230,8 +241,8 @@ func (p *proxy) forwardStream(w http.ResponseWriter, body io.Reader) {
 	// reasoning. Publishing on every chunk lets a concurrent follow-up request
 	// read a partial value, which the provider rejects. Commit only after the
 	// upstream explicitly finishes the response.
-	if complete && reasoning.Len() > 0 && len(ids) > 0 {
-		p.cache.put(mapKeys(ids), reasoning.String())
+	if complete && reasoning.Len() > 0 {
+		p.cache.put(toolCalls.ids(), reasoning.String())
 	}
 }
 
@@ -258,7 +269,37 @@ func streamCompleteLine(line string) bool {
 	return false
 }
 
-func captureStreamLine(line string, reasoning *strings.Builder, ids map[string]bool) {
+type streamToolCalls struct {
+	idsByIndex map[int]*strings.Builder
+}
+
+func newStreamToolCalls() *streamToolCalls {
+	return &streamToolCalls{idsByIndex: map[int]*strings.Builder{}}
+}
+
+func (s *streamToolCalls) add(index int, fragment string) {
+	if fragment == "" {
+		return
+	}
+	b := s.idsByIndex[index]
+	if b == nil {
+		b = &strings.Builder{}
+		s.idsByIndex[index] = b
+	}
+	b.WriteString(fragment)
+}
+
+func (s *streamToolCalls) ids() []string {
+	ids := make([]string, 0, len(s.idsByIndex))
+	for i := 0; i < len(s.idsByIndex); i++ {
+		if b := s.idsByIndex[i]; b != nil && b.Len() > 0 {
+			ids = append(ids, b.String())
+		}
+	}
+	return ids
+}
+
+func captureStreamLine(line string, reasoning *strings.Builder, toolCalls *streamToolCalls) {
 	line = strings.TrimSpace(line)
 	if !strings.HasPrefix(line, "data:") {
 		return
@@ -276,8 +317,14 @@ func captureStreamLine(line string, reasoning *strings.Builder, ids map[string]b
 		choice, _ := rawChoice.(map[string]any)
 		delta, _ := choice["delta"].(map[string]any)
 		reasoning.WriteString(reasoningValue(delta))
-		for _, id := range toolCallIDs(delta["tool_calls"]) {
-			ids[id] = true
+		items, _ := delta["tool_calls"].([]any)
+		for position, raw := range items {
+			item, _ := raw.(map[string]any)
+			index := position
+			if n, ok := item["index"].(float64); ok && n >= 0 {
+				index = int(n)
+			}
+			toolCalls.add(index, stringValue(item["id"]))
 		}
 	}
 }
@@ -307,14 +354,6 @@ func toolCallIDs(v any) []string {
 func stringValue(v any) string {
 	s, _ := v.(string)
 	return s
-}
-
-func mapKeys(m map[string]bool) []string {
-	ids := make([]string, 0, len(m))
-	for id := range m {
-		ids = append(ids, id)
-	}
-	return ids
 }
 
 func copyHeaders(dst, src http.Header) {

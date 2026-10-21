@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/xynogen/ogc/internal/config"
@@ -146,8 +147,39 @@ func (s *sessionRouter) adminState(w http.ResponseWriter) {
 	for id := range s.cfg.Models {
 		models = append(models, id)
 	}
-	sort.Strings(models)
+	sort.Slice(models, func(i, j int) bool {
+		iIn, iOut := displayedModelPrices(models[i])
+		jIn, jOut := displayedModelPrices(models[j])
+		if iIn != jIn {
+			return iIn < jIn
+		}
+		if iOut != jOut {
+			return iOut < jOut
+		}
+		return models[i] < models[j]
+	})
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"accounts": accounts, "sessions": sessions, "models": models, "editable": os.Getenv("OGC_API_KEYS") == ""})
+}
+
+func displayedModelPrices(name string) (float64, float64) {
+	return displayedModelPrice(name, "输入 $"), displayedModelPrice(name, "输出 $")
+}
+
+func displayedModelPrice(name, marker string) float64 {
+	start := strings.Index(name, marker)
+	if start < 0 {
+		return 1e100
+	}
+	start += len(marker)
+	end := strings.Index(name[start:], "/")
+	if end < 0 {
+		return 1e100
+	}
+	price, err := strconv.ParseFloat(name[start:start+end], 64)
+	if err != nil {
+		return 1e100
+	}
+	return price
 }
 
 type discoveredSession struct {
@@ -311,20 +343,7 @@ func (s *sessionRouter) adminAddAccount(w http.ResponseWriter, r *http.Request) 
 	if in.Name == "" {
 		in.Name = fmt.Sprintf("账号 %d", len(s.accounts)+1)
 	}
-	defaultModel := ""
-	if len(s.accounts) > 0 {
-		defaultModel = s.accounts[0].Model
-	}
-	if defaultModel == "" {
-		models := make([]string, 0, len(s.cfg.Models))
-		for id := range s.cfg.Models {
-			models = append(models, id)
-		}
-		sort.Strings(models)
-		if len(models) > 0 {
-			defaultModel = models[0]
-		}
-	}
+	defaultModel := config.DefaultAccountModel(s.cfg.Models)
 	a := config.Account{ID: "key-" + digest(in.APIKey), Name: in.Name, APIKey: in.APIKey, Model: defaultModel}
 	for _, existing := range s.accounts {
 		if existing.ID == a.ID || existing.Name == a.Name {
@@ -571,10 +590,22 @@ var adminPage = template.Must(template.New("admin").Parse(`<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>OGC 账号与会话</title><style>
 body{font:14px system-ui;margin:0;background:#f5f6f8;color:#18202a}.wrap{max-width:1100px;margin:32px auto;padding:0 18px}h1{font-size:24px}section{background:white;border:1px solid #ddd;border-radius:12px;padding:18px;margin:16px 0}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px;border-bottom:1px solid #eee}input,select,button{padding:8px;border:1px solid #bbb;border-radius:7px}button{cursor:pointer;background:#fff}.primary{background:#1769e0;color:white;border-color:#1769e0}.danger{color:#b00020}.muted{color:#68707b}.row{display:flex;gap:8px;flex-wrap:wrap}.grow{flex:1;min-width:180px}.account-name{display:flex;align-items:center;gap:10px}.account-name input[type=checkbox]{width:18px;height:18px;cursor:pointer}.account-name input[type=text]{min-width:150px}.icon-button{font-size:17px;line-height:1;padding:7px 9px}.session-preview{position:relative;display:inline-block;cursor:help}.session-preview[data-preview]:hover:after,.session-preview[data-preview]:focus:after{content:attr(data-preview);position:absolute;z-index:20;left:0;top:calc(100% + 8px);width:min(480px,75vw);padding:10px 12px;border-radius:8px;background:#18202a;color:#fff;white-space:pre-wrap;line-height:1.45;box-shadow:0 6px 24px #0004;pointer-events:none}#msg{position:fixed;right:20px;bottom:20px;background:#222;color:#fff;padding:10px 14px;border-radius:8px;display:none}@media(max-width:650px){.optional{display:none}}
-</style></head><body><main class="wrap"><h1>OGC 账号与会话</h1><p class="muted">Key 只显示首尾字符。会话改绑从下一次请求生效。</p>
+dialog{width:min(820px,90vw);max-height:85vh;overflow:auto;border:0;border-radius:12px;padding:24px}dialog::backdrop{background:#0007}#usageConfig{white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f6f8;padding:16px;border-radius:8px}dialog p{line-height:1.6}dialog label{display:inline-block;margin:8px}
+</style></head><body><main class="wrap"><h1>OGC 账号与会话</h1><button class="primary" onclick="openUsage()">Claude Code 接入</button><p class="muted">Key 只显示首尾字符。会话改绑从下一次请求生效。</p>
 <section><h2>账号</h2><div class="row"><input id="key" class="grow" type="password" placeholder="输入新账号的 API key"><button class="primary" onclick="addAccount()">添加</button></div><table><thead><tr><th>启用与名称</th><th>Key</th><th>默认模型</th><th>操作</th></tr></thead><tbody id="accounts"></tbody></table></section>
 <section><h2>会话绑定</h2><input id="filter" placeholder="搜索 session ID" oninput="renderSessions()"><table><thead><tr><th>Session ID</th><th>最后通讯时间</th><th>账号</th><th>真实模型</th></tr></thead><tbody id="sessions"></tbody></table></section></main><div id="msg"></div>
+<dialog id="usageDialog" aria-labelledby="usageTitle"><div class="row"><h2 id="usageTitle" class="grow">Claude Code 接入</h2><button onclick="document.getElementById('usageDialog').close()">关闭</button></div>
+<p>先启动 OGC，在本页面添加并启用账号。把下方 YOUR_API_KEY 替换为已添加账号的 Key，不要填掩码。</p>
+<p>模型名输入具体模型名称或 ID，即固定使用该模型；输入 <code>automodel</code>，由 admin 决定最终模型。新会话使用账号默认模型，已有会话在“会话绑定 → 真实模型”中调整；修改默认模型不会覆盖已有会话。固定模型与会话绑定冲突时请新建会话。</p>
+<label>模型 <input id="usageModel" value="automodel" list="usageModels" oninput="renderUsage()"><datalist id="usageModels"></datalist></label>
+<label>配置格式 <select id="usageFormat" onchange="renderUsage()"><option value="sh">macOS / Linux 启动命令</option><option value="ps">Windows PowerShell 启动命令</option><option value="json">settings.json</option></select></label>
+<pre id="usageConfig" tabindex="0"></pre><button class="primary" onclick="copyUsage()">复制配置</button>
+<p>终端命令在当前窗口执行后启动 Claude Code。JSON 合并到 ~/.claude/settings.json（Windows 为 %USERPROFILE%\.claude\settings.json），保留原有设置，重启 Claude Code；先清除外部环境中的 ANTHROPIC_AUTH_TOKEN。每个新会话应使用独立的 x-opencode-session，续用同一会话时保留该值；JSON 中 SESSION_ID 请自行替换。</p>
+<p>本机已有 claude_opencode 脚本时可直接运行：默认 automodel，自动生成会话 ID。临时固定模型可运行 claude_opencode --model 具体模型ID。配置不包含真实 Key；请自行替换后使用。</p></dialog>
 <script>
+function openUsage(){document.getElementById('usageModels').innerHTML='<option value="automodel"></option>'+state.models.map(m=>'<option value="'+esc(m)+'"></option>').join('');renderUsage();document.getElementById('usageDialog').showModal()}
+function renderUsage(){const model=document.getElementById('usageModel').value.trim()||'automodel',format=document.getElementById('usageFormat').value;const env={ANTHROPIC_BASE_URL:location.origin,ANTHROPIC_API_KEY:'YOUR_API_KEY',ANTHROPIC_MODEL:model,ANTHROPIC_DEFAULT_OPUS_MODEL:model,ANTHROPIC_DEFAULT_SONNET_MODEL:model,ANTHROPIC_DEFAULT_HAIKU_MODEL:model};let text;if(format==='json'){env.ANTHROPIC_CUSTOM_HEADERS='x-opencode-session: SESSION_ID';text=JSON.stringify({env},null,2)}else if(format==='ps'){text=Object.entries(env).map(([k,v])=>'$env:'+k+" = '"+v.replace(/'/g,"''")+"'").join('\n')+'\nRemove-Item Env:ANTHROPIC_AUTH_TOKEN -ErrorAction SilentlyContinue\n$env:ANTHROPIC_CUSTOM_HEADERS = "x-opencode-session: $([guid]::NewGuid())"\nclaude'}else{const quote=v=>"'"+v.replace(/'/g,"'\\''")+"'";text=Object.entries(env).map(([k,v])=>'export '+k+'='+quote(v)).join('\n')+'\nunset ANTHROPIC_AUTH_TOKEN\nexport ANTHROPIC_CUSTOM_HEADERS="x-opencode-session: $(uuidgen)"\nclaude'}document.getElementById('usageConfig').textContent=text}
+async function copyUsage(){const text=document.getElementById('usageConfig').textContent;try{if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(text)}else{const el=document.createElement('textarea');el.value=text;document.getElementById('usageDialog').appendChild(el);el.select();const ok=document.execCommand('copy');el.remove();if(!ok)throw Error('copy')}toast('已复制，请替换 YOUR_API_KEY')}catch(e){toast('复制失败，请选择配置文本手动复制')}}
 let state={accounts:[],sessions:[]};const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function api(path,opt){let r=await fetch('/admin/api/'+path,{headers:{'Content-Type':'application/json'},...opt});if(!r.ok)throw Error(await r.text());return r.status===204?null:r.json()}
 function toast(s){let e=document.querySelector('#msg');e.textContent=s.trim();e.style.display='block';setTimeout(()=>e.style.display='none',3500)}

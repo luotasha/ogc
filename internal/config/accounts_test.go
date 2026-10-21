@@ -34,3 +34,14 @@ func TestAtLeastOneAccountEnabled(t *testing.T) {
 		t.Fatal("accepted configuration with every account disabled")
 	}
 }
+
+func TestDefaultAccountModelPrefersDeepSeekV41Flash(t *testing.T) {
+	models := map[string]ModelConfig{
+		"Alpha":    {ModelID: "alpha"},
+		"DeepSeek": {ModelID: "deepseek-v4.1-flash"},
+		"Another":  {ModelID: "another"},
+	}
+	if got := DefaultAccountModel(models); got != "DeepSeek" {
+		t.Fatalf("got %q", got)
+	}
+}

@@ -21,10 +21,11 @@ func TestCaptureAndPatchNonStreaming(t *testing.T) {
 func TestCaptureStreamingReasoning(t *testing.T) {
 	p := testProxy(t)
 	var reasoning strings.Builder
-	ids := map[string]bool{}
-	captureStreamLine(`data: {"choices":[{"delta":{"reasoning_content":"think "}}]}`, &reasoning, ids)
-	captureStreamLine(`data: {"choices":[{"delta":{"reasoning_content":"fully","tool_calls":[{"id":"call_2","index":0}]}}]}`, &reasoning, ids)
-	p.cache.put(mapKeys(ids), reasoning.String())
+	toolCalls := newStreamToolCalls()
+	captureStreamLine(`data: {"choices":[{"delta":{"reasoning_content":"think "}}]}`, &reasoning, toolCalls)
+	captureStreamLine(`data: {"choices":[{"delta":{"reasoning_content":"fully","tool_calls":[{"id":"call_","index":0}]}}]}`, &reasoning, toolCalls)
+	captureStreamLine(`data: {"choices":[{"delta":{"tool_calls":[{"id":"2","index":0}]}}]}`, &reasoning, toolCalls)
+	p.cache.put(toolCalls.ids(), reasoning.String())
 	body, n := p.patchRequest([]byte(`{"messages":[{"role":"assistant","tool_calls":[{"id":"call_2"}]}]}`))
 	if n != 1 {
 		t.Fatalf("expected patch: %s", body)
@@ -40,11 +41,22 @@ func TestCaptureStreamingReasoning(t *testing.T) {
 	}
 }
 
+func TestStreamingToolCallIDsAreReassembledByIndex(t *testing.T) {
+	var reasoning strings.Builder
+	toolCalls := newStreamToolCalls()
+	captureStreamLine(`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ab"},{"index":1,"id":"call_x"}]}}]}`, &reasoning, toolCalls)
+	captureStreamLine(`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"cd"},{"index":1,"id":"yz"}]}}]}`, &reasoning, toolCalls)
+	got := toolCalls.ids()
+	if len(got) != 2 || got[0] != "call_abcd" || got[1] != "call_xyz" {
+		t.Fatalf("unexpected IDs: %#v", got)
+	}
+}
+
 func TestPatchAddsContentWithoutCachedReasoning(t *testing.T) {
 	p := testProxy(t)
 	body, n := p.patchRequest([]byte(`{"messages":[{"role":"assistant","tool_calls":[{"id":"unknown"}]},{"role":"tool","tool_call_id":"unknown"}]}`))
-	if n != 0 {
-		t.Fatalf("unexpected reasoning injection: %d", n)
+	if n != 1 {
+		t.Fatalf("expected compatibility reasoning injection: %d", n)
 	}
 	var root map[string]any
 	if err := json.Unmarshal(body, &root); err != nil {
@@ -53,6 +65,9 @@ func TestPatchAddsContentWithoutCachedReasoning(t *testing.T) {
 	msg := root["messages"].([]any)[0].(map[string]any)
 	if got, ok := msg["content"]; !ok || got != "" {
 		t.Fatalf("content not normalized: %v", msg)
+	}
+	if got := msg["reasoning_content"]; got != missingReasoningFallback {
+		t.Fatalf("missing fallback reasoning: %v", got)
 	}
 	tool := root["messages"].([]any)[1].(map[string]any)
 	if got, ok := tool["content"]; !ok || got != "" {

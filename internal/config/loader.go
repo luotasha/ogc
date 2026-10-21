@@ -170,13 +170,14 @@ func validate(cfg *Config) error {
 			modelIDs = append(modelIDs, id)
 		}
 		sort.Strings(modelIDs)
+		defaultModel := DefaultAccountModel(cfg.Models)
 		for i := range cfg.Accounts {
 			a := &cfg.Accounts[i]
 			if a.ID == "" || a.APIKey == "" || strings.Contains(a.APIKey, "${") || seen[a.ID] {
 				return fmt.Errorf("accounts require unique IDs and resolved nonempty keys")
 			}
-			if a.Model == "" && len(modelIDs) > 0 {
-				a.Model = modelIDs[0]
+			if a.Model == "" && defaultModel != "" {
+				a.Model = defaultModel
 			}
 			if _, ok := cfg.Models[a.Model]; !ok {
 				return fmt.Errorf("account %q references unknown model %q", a.ID, a.Model)
@@ -199,4 +200,24 @@ func validate(cfg *Config) error {
 		return fmt.Errorf("api_key is required (set via config file or OGC_API_KEY env var)")
 	}
 	return nil
+}
+
+// DefaultAccountModel prefers DeepSeek V4.1 Flash for OpenCode Go accounts.
+// It returns the configured display key because account models reference keys,
+// rather than upstream model IDs.
+func DefaultAccountModel(models map[string]ModelConfig) string {
+	for key, model := range models {
+		if model.ModelID == "deepseek-v4.1-flash" {
+			return key
+		}
+	}
+	keys := make([]string, 0, len(models))
+	for key := range models {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	if len(keys) > 0 {
+		return keys[0]
+	}
+	return ""
 }

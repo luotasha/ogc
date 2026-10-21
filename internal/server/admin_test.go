@@ -190,3 +190,14 @@ func TestSessionPreviewUsesRecentConversationText(t *testing.T) {
 		t.Fatalf("preview = %q, want %q", got, want)
 	}
 }
+
+func TestDisplayedModelPrices(t *testing.T) {
+	in, out := displayedModelPrices("DeepSeek V4.1 Flash（输入 $0.30/M，输出 $1.20/M）")
+	if in != 0.30 || out != 1.20 {
+		t.Fatalf("unexpected prices: %v %v", in, out)
+	}
+	unknownIn, unknownOut := displayedModelPrices("custom-model")
+	if unknownIn < 1e99 || unknownOut < 1e99 {
+		t.Fatalf("unpriced model should sort last: %v %v", unknownIn, unknownOut)
+	}
+}

@@ -1,12 +1,13 @@
 # OGC Admin Routing
 
-本项目基于 [xynogen/ogc](https://github.com/xynogen/ogc) 扩展，面向 Claude Code 通过 OpenCode Go 等 OpenAI 兼容端点工作的场景。它保留上游的 Anthropic ↔ OpenAI 协议转换能力，并增加多账号、会话固定路由、可视化管理和推理内容兼容处理。
+本项目基于 [xynogen/ogc](https://github.com/xynogen/ogc) 扩展，专门适配 **OpenCode Go 订阅**，用于让 Claude Code 通过 OpenCode Go 的模型服务工作。它保留上游的 Anthropic ↔ OpenAI 协议转换能力，并增加多订阅账号、会话固定路由、可视化管理和推理内容兼容处理。
 
 ## 相比上游增加的功能
 
 - **多账号 Key 管理**：支持多个命名账号；可在管理页面添加、修改名称、启用、禁用和删除 Key。Key 写入本地配置文件，不需要放在 shell 环境变量中。
 - **会话固定到账号**：首次请求为会话选择账号，之后该会话持续使用同一个 Key，避免一个 Claude Code 会话在多个订阅账号之间切换。
 - **按账号选择模型**：每个账号可以设置自己的默认模型。当 Claude Code 发送 `automodel` 时，OGC 将其替换为该账号配置的真实模型。
+- **价格排序与默认模型**：管理页面的模型按照输入价格从低到高排列；账号没有指定模型以及新增账号时，默认选择 DeepSeek V4.1 Flash。
 - **按会话切换模型**：已经存在的会话可以单独指定真实模型，不影响同一账号下的其他会话。
 - **本地管理页面**：访问 `http://127.0.0.1:3456/admin/` 管理账号、模型及会话绑定。页面仅允许本机访问。
 - **会话识别信息**：会话列表显示最后通信时间和真实模型；鼠标悬停 Session ID 可查看近期对话摘要，方便对应终端窗口。
@@ -99,3 +100,27 @@ http://127.0.0.1:3460/v1
 ## 上游文档
 
 OGC 的基础代理原理、完整配置结构和上游功能请阅读：[xynogen/ogc README](https://github.com/xynogen/ogc/blob/main/README.md)。
+
+## Claude Code 通过 OGC 接入
+
+启动 OGC 并在 `/admin/` 添加启用账号，点击「Claude Code 接入」可查看、选择模型并复制 macOS/Linux、Windows PowerShell 或 settings.json 配置。复制内容只含占位 Key，不会泄露已有密钥。
+
+本机 `claude_opencode` 启动脚本的核心配置如下：
+
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:3456"
+export ANTHROPIC_API_KEY="YOUR_API_KEY"
+unset ANTHROPIC_AUTH_TOKEN
+export ANTHROPIC_MODEL="automodel"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="automodel"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="automodel"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="automodel"
+export ANTHROPIC_CUSTOM_HEADERS="x-opencode-session: $(uuidgen)"
+claude
+```
+
+YOUR_API_KEY 使用 admin 已添加账号的真实 Key。macOS/Linux 执行上面的命令；Windows 在接入浮窗中选择 PowerShell，使用 `[guid]::NewGuid()` 生成会话标识。已有本机脚本时直接运行 `claude_opencode`，参数原样传递给 Claude Code。原脚本还设置 SNAPVIEW_AUTO_TRIGGER=1、CLAUDE_CODE_AUTO_COMPACT_WINDOW=190000，并使用 --dangerously-skip-permissions；这些不是 OGC 接入的必要条件。
+
+**输入具体模型名称或 ID 即固定模型；输入 automodel 则由 admin 确定最终模型。** 新会话读取账号默认模型；已有会话在「会话绑定 → 真实模型」切换，下一次请求生效。账号默认模型的修改只影响新会话。固定模型与既有会话绑定冲突时，新建会话再使用；不要把一个会话 ID 复用于不同会话。临时指定模型可用 `claude_opencode --model 具体模型ID`。
+
+也可把 env 字段合并到 `~/.claude/settings.json`（Windows：`%USERPROFILE%\.claude\settings.json`），保留原有配置并重启 Claude Code。JSON 配置模板见 admin 浮窗，其中 SESSION_ID 要为新会话生成并替换，同一会话续用时保持不变。不要同时保留外部的 ANTHROPIC_AUTH_TOKEN，以免覆盖 API Key 认证。
