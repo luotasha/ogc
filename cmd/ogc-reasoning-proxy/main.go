@@ -228,6 +228,12 @@ func (p *proxy) forwardStream(w http.ResponseWriter, body io.Reader) {
 		if line != "" {
 			captureStreamLine(line, &reasoning, toolCalls)
 			complete = complete || streamCompleteLine(line)
+			// Persist before forwarding the tool-call chunk. Claude Code can run
+			// a fast tool and submit its result before the provider emits [DONE],
+			// or it can close the stream once it has the call. Saving here gives
+			// the follow-up request a happens-before relationship with the cache.
+			// Later ID fragments update the entry again under the complete ID.
+			p.cache.put(toolCalls.ids(), reasoning.String())
 			_, _ = io.WriteString(w, line)
 			if flusher != nil {
 				flusher.Flush()
@@ -237,10 +243,8 @@ func (p *proxy) forwardStream(w http.ResponseWriter, body io.Reader) {
 			break
 		}
 	}
-	// A tool call can reach the client before the provider finishes streaming its
-	// reasoning. Publishing on every chunk lets a concurrent follow-up request
-	// read a partial value, which the provider rejects. Commit only after the
-	// upstream explicitly finishes the response.
+	// Keep a final commit for nonstandard streams where the completion marker and
+	// last payload arrive together.
 	if complete && reasoning.Len() > 0 {
 		p.cache.put(toolCalls.ids(), reasoning.String())
 	}

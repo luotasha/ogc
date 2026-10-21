@@ -75,15 +75,15 @@ func TestPatchAddsContentWithoutCachedReasoning(t *testing.T) {
 	}
 }
 
-func TestForwardStreamPublishesOnlyCompleteReasoning(t *testing.T) {
+func TestForwardStreamPublishesBeforeCompletion(t *testing.T) {
 	p := testProxy(t)
 	stream := strings.Join([]string{
 		`data: {"choices":[{"delta":{"reasoning_content":"think ","tool_calls":[{"id":"call_race","index":0}]}}]}`,
 		`data: {"choices":[{"delta":{"reasoning_content":"fully"}}]}`,
 	}, "\n") + "\n"
 	p.forwardStream(httptest.NewRecorder(), strings.NewReader(stream))
-	if _, ok := p.cache.get([]string{"call_race"}); ok {
-		t.Fatal("published reasoning before the stream completed")
+	if got, ok := p.cache.get([]string{"call_race"}); !ok || got != "think fully" {
+		t.Fatalf("reasoning unavailable to concurrent tool result: %q %v", got, ok)
 	}
 
 	stream += "data: [DONE]\n"
