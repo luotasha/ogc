@@ -154,6 +154,7 @@ func (t *RequestTransformer) transformUserMessage(blocks []types.ContentBlock) (
 // transformAssistantMessage converts an assistant message with potential tool_use blocks.
 func (t *RequestTransformer) transformAssistantMessage(blocks []types.ContentBlock) ([]types.ChatMessage, error) {
 	var textParts []string
+	var thinkingParts []string
 	var toolCalls []types.ToolCall
 
 	for _, block := range blocks {
@@ -161,8 +162,10 @@ func (t *RequestTransformer) transformAssistantMessage(blocks []types.ContentBlo
 		case "text":
 			textParts = append(textParts, block.Text)
 		case "thinking":
-			// Skip thinking blocks — OpenAI doesn't have an equivalent
-			// (some models support reasoning_effort but not raw thinking blocks)
+			// OpenCode Go thinking models require the previous reasoning text to
+			// be passed back on tool-call continuations. Dropping this block makes
+			// resumed Claude Code sessions fail with HTTP 400.
+			thinkingParts = append(thinkingParts, block.Thinking)
 		case "tool_use":
 			// Map to OpenAI function call format
 			arguments := "{}"
@@ -185,11 +188,16 @@ func (t *RequestTransformer) transformAssistantMessage(blocks []types.ContentBlo
 	for _, p := range textParts {
 		content += p
 	}
+	reasoningContent := ""
+	for _, p := range thinkingParts {
+		reasoningContent += p
+	}
 
 	msg := types.ChatMessage{
-		Role:      "assistant",
-		Content:   content,
-		ToolCalls: toolCalls,
+		Role:             "assistant",
+		Content:          content,
+		ReasoningContent: reasoningContent,
+		ToolCalls:        toolCalls,
 	}
 
 	return []types.ChatMessage{msg}, nil

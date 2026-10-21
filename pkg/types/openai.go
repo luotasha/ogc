@@ -21,12 +21,13 @@ type ChatCompletionRequest struct {
 
 // ChatMessage represents a single message in the conversation.
 type ChatMessage struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content"`
-	Reasoning  string     `json:"reasoning,omitempty"` // extended-thinking models (Kimi, DeepSeek R1)
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	Name       string     `json:"name,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Role             string     `json:"role"`
+	Content          string     `json:"content"`
+	Reasoning        string     `json:"reasoning,omitempty"`         // provider response alias
+	ReasoningContent string     `json:"reasoning_content,omitempty"` // OpenCode Go thinking history
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+	Name             string     `json:"name,omitempty"`
+	ToolCallID       string     `json:"tool_call_id,omitempty"`
 }
 
 // ToolCall represents a function call made by the model.
