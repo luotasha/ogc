@@ -1,445 +1,101 @@
-# ogc
+# OGC Admin Routing
 
-A Go CLI proxy that lets you use any [OpenAI-compatible API](https://platform.openai.com/docs/api-reference/chat) with [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
+本项目基于 [xynogen/ogc](https://github.com/xynogen/ogc) 扩展，面向 Claude Code 通过 OpenCode Go 等 OpenAI 兼容端点工作的场景。它保留上游的 Anthropic ↔ OpenAI 协议转换能力，并增加多账号、会话固定路由、可视化管理和推理内容兼容处理。
 
-`ogc` sits between Claude Code and your chosen backend, intercepting Anthropic API requests, transforming them to OpenAI Chat Completions format, and forwarding them to your endpoint. Claude Code thinks it's talking to Anthropic — but your requests go to whichever models and provider you configure.
+## 相比上游增加的功能
 
-## Why?
+- **多账号 Key 管理**：支持多个命名账号；可在管理页面添加、修改名称、启用、禁用和删除 Key。Key 写入本地配置文件，不需要放在 shell 环境变量中。
+- **会话固定到账号**：首次请求为会话选择账号，之后该会话持续使用同一个 Key，避免一个 Claude Code 会话在多个订阅账号之间切换。
+- **按账号选择模型**：每个账号可以设置自己的默认模型。当 Claude Code 发送 `automodel` 时，OGC 将其替换为该账号配置的真实模型。
+- **按会话切换模型**：已经存在的会话可以单独指定真实模型，不影响同一账号下的其他会话。
+- **本地管理页面**：访问 `http://127.0.0.1:3456/admin/` 管理账号、模型及会话绑定。页面仅允许本机访问。
+- **会话识别信息**：会话列表显示最后通信时间和真实模型；鼠标悬停 Session ID 可查看近期对话摘要，方便对应终端窗口。
+- **会话列表清理**：管理页面只展示最近 30 天内实际通信过的会话，不显示没有通信时间的陈旧绑定。
+- **稳定的 Session ID 传递**：补充 Claude Code 与 OpenCode 上游之间的会话标识传播，减少恢复会话后重新分配 Key 的情况。
+- **上游错误保真**：保留上游返回的错误状态与正文，并改进熔断分类，避免把请求格式错误误判成模型故障。
+- **请求兼容修复**：处理消息顺序、缺失 `content` 字段等兼容问题，降低长会话或工具调用时的 400/422 错误。
+- **推理内容兼容代理**：附带 `ogc-reasoning-proxy`，缓存工具调用对应的 `reasoning_content`，并在后续请求中恢复，解决部分思考模型要求回传推理内容的问题。
+- **跨平台构建**：GitHub Actions 同时构建 macOS、Linux、Windows 的 AMD64/ARM64 版本，并产出 `ogc` 与 `ogc-reasoning-proxy`。
 
-Claude Code is locked to the Anthropic API format. This proxy breaks that lock: point it at any OpenAI-compatible endpoint — [OpenAI](https://platform.openai.com/docs/api-reference/chat), a local [Ollama](https://ollama.ai) instance, [OpenRouter](https://openrouter.ai), [LiteLLM](https://docs.litellm.ai/), or your own deployment — and Claude Code just works with it. No patches, no forks, just set two environment variables and go.
+## 构建
 
-## Features
-
-- **Transparent Proxy** — Claude Code sends Anthropic-format requests, proxy transforms to OpenAI format and back
-- **Any OpenAI-compatible Backend** — Works with OpenCode Go, Ollama, OpenRouter, vLLM, or any `/v1/chat/completions` endpoint
-- **Model Routing** — Automatically routes to different models based on context (default, thinking, long context, background)
-- **Fallback Chains** — If a model fails, automatically tries the next one in your configured chain
-- **Circuit Breaker** — Tracks model health and skips failing models to avoid latency spikes
-- **Real-time Streaming** — Full SSE streaming with live OpenAI → Anthropic format transformation
-- **Tool Calling** — Proper Anthropic tool_use/tool_result ↔ OpenAI function calling translation
-- **Provider Support** — Route to OpenAI (`/v1/chat/completions`) or Anthropic (`/v1/messages`) endpoints per model
-- **Token Counting** — Uses tiktoken (cl100k_base) for accurate token counting and context threshold detection
-- **JSON Configuration** — Flexible config file with environment variable overrides and `${VAR}` interpolation
-- **Background Mode** — Run as daemon detached from terminal
-- **Auto-start on Login** — Launch on system startup via launchd (macOS)
-
-## Installation
-
-### Go Install
+需要 Go 1.25 或更高版本。
 
 ```bash
-go install github.com/xynogen/ogc/cmd/ogc@latest
-```
-
-### Build from Source
-
-```bash
-git clone https://github.com/xynogen/ogc.git
+git clone https://github.com/luotasha/ogc.git
 cd ogc
-make build
-# Optionally install to $GOPATH/bin
-make install
-```
-
-### Download a Release Binary
-
-Download the latest release for your platform from the [Releases page](https://github.com/xynogen/ogc/releases):
-
-| Platform | File |
-|----------|------|
-| macOS (Apple Silicon) | `ogc_darwin-arm64` |
-| macOS (Intel) | `ogc_darwin-amd64` |
-| Linux (x86_64) | `ogc_linux-amd64` |
-| Linux (ARM64) | `ogc_linux-arm64` |
-| Windows (x86_64) | `ogc_windows-amd64.exe` |
-| Windows (ARM64) | `ogc_windows-arm64.exe` |
-
-```bash
-# Example: macOS Apple Silicon
-curl -L -o ogc https://github.com/xynogen/ogc/releases/latest/download/ogc_darwin-arm64
-chmod +x ogc
-sudo mv ogc /usr/local/bin/
-```
-
-### Requirements
-
-- An API key for your chosen backend (if required)
-- Go 1.21+ (only needed if building from source)
-
-## Quick Start
-
-### 1. Initialize Configuration
-
-```bash
-ogc init
-```
-
-Creates a default config at `~/.config/ogc/config.json`.
-
-### 2. Set Your API Key and Backend URL
-
-```bash
-export OGC_API_KEY=your-api-key-here
-export OGC_OPENAI_BASE=https://your-openai-compatible-endpoint/v1/chat/completions
-```
-
-Examples:
-- **OpenAI**: `https://api.openai.com/v1/chat/completions`
-- **Ollama**: `http://localhost:11434/v1/chat/completions`
-- **OpenRouter**: `https://openrouter.ai/api/v1/chat/completions`
-- **LiteLLM**: `http://localhost:4000/v1/chat/completions`
-
-### 3. Start the Proxy
-
-```bash
-ogc serve
-```
-
-You'll see output like:
-
-```
-Starting ogc v0.1.0
-Listening on 127.0.0.1:3456
-Forwarding to: https://your-openai-compatible-endpoint/v1/chat/completions
-
-Configure Claude Code with:
-  export ANTHROPIC_BASE_URL=http://127.0.0.1:3456
-  export ANTHROPIC_AUTH_TOKEN=unused
-```
-
-#### Running in Background
-
-To run the proxy in the background (detached from terminal):
-
-```bash
-ogc serve --background
-# or
-ogc serve -b
-```
-
-This starts the server as a background daemon and returns immediately. Logs are written to `~/.config/ogc/ogc.log`.
-
-#### Auto-start on Login
-
-To start the proxy automatically when you log in:
-
-```bash
-ogc autostart enable
-```
-
-This creates a launchd plist on macOS. To disable:
-
-```bash
-ogc autostart disable
-```
-
-Check status:
-
-```bash
-ogc autostart status
-```
-
-### 4. Configure Claude Code
-
-In a separate terminal (or the same one before running `claude`):
-
-```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:3456
-export ANTHROPIC_AUTH_TOKEN=unused
-```
-
-### 5. Run Claude Code
-
-```bash
-claude
-```
-
-That's it. Claude Code will now route all requests through ogc to your configured backend.
-
-## How It Works
-
-```
-┌─────────────┐     Anthropic API      ┌─────────────┐     OpenAI API          ┌──────────────────────┐
-│  Claude Code ├──────────────────────►│  ogc         ├────────────────────────►│  Any OpenAI-compatible│
-│  (CLI)       │  POST /v1/messages   │  (Proxy)     │  /v1/chat/completions  │  backend              │
-│              │◄──────────────────────┤              │◄────────────────────────┤                      │
-└─────────────┘   Anthropic SSE        └─────────────┘   OpenAI SSE             └──────────────────────┘
-```
-
-1. Claude Code sends a request in [Anthropic Messages API](https://docs.anthropic.com/en/api/messages) format
-2. ogc parses the request, counts tokens, and selects a model via routing rules
-3. The request is transformed to [OpenAI Chat Completions](https://platform.openai.com/docs/api-reference/chat) format
-4. The transformed request is sent to your configured endpoint
-5. The response (streaming or non-streaming) is transformed back to Anthropic format
-6. Claude Code receives the response as if it came from Anthropic directly
-
-### What Gets Transformed
-
-| Anthropic | OpenAI |
-|-----------|--------|
-| `system` (string or array) | `messages[0]` with `role: "system"` |
-| `content: [{"type":"text","text":"..."}]` | `content: "..."` |
-| `tool_use` content blocks | `tool_calls` array |
-| `tool_result` content blocks | `role: "tool"` messages |
-| `thinking` content blocks | Skipped (no equivalent) |
-| `stop_reason: "end_turn"` | `finish_reason: "stop"` |
-| `stop_reason: "tool_use"` | `finish_reason: "tool_calls"` |
-| SSE `message_start` / `content_block_delta` / `message_stop` | SSE `role` / `delta.content` / `[DONE]` |
-
-## Configuration
-
-### Config File
-
-Location: `~/.config/ogc/config.json`
-
-Override with `OGC_CONFIG` environment variable.
-
-### Full Config Reference
-
-```json
-{
-  "api_key": "${OGC_API_KEY}",
-  "host": "127.0.0.1",
-  "port": 3456,
-
-  "models": {
-    "default": {
-      "provider": "openai",
-      "model_id": "gpt-4o",
-      "temperature": 0.7,
-      "max_tokens": 4096
-    }
-  },
-
-  "model_mapping": {
-    "claude-opus": "default",
-    "claude-sonnet": "default",
-    "claude-haiku": "default"
-  },
-
-  "upstream": {
-    "base_url": "https://api.openai.com/v1",
-    "anthropic_base_url": "https://api.anthropic.com",
-    "timeout_ms": 300000
-  },
-
-  "logging": {
-    "level": "info",
-    "requests": true
-  }
-}
-```
-
-### Environment Variables
-
-Environment variables override config file values. Config values also support `${VAR}` interpolation.
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `OGC_API_KEY` | API key for your backend (**required**) | — |
-| `OGC_CONFIG` | Custom config file path | `~/.config/ogc/config.json` |
-| `OGC_HOST` | Proxy listen host | `127.0.0.1` |
-| `OGC_PORT` | Proxy listen port | `3456` |
-| `OGC_OPENAI_BASE` | Full URL to your OpenAI-compatible `/v1/chat/completions` endpoint | `https://api.openai.com/v1/chat/completions` |
-| `OGC_LOG_LEVEL` | Log level: `debug`, `info`, `warn`, `error` | `info` |
-
-### Model Mapping
-
-The `model_mapping` section maps Claude Code model names to your configured models:
-
-| Claude Model | Maps To | Notes |
-| ------------ | ------- | ----- |
-| `claude-opus` | Your preferred model | Primary model |
-| `claude-sonnet` | Your preferred model | Balanced choice |
-| `claude-haiku` | Your preferred model | Fast/cheap option |
-
-### Provider
-
-The `provider` field in each model config determines the endpoint:
-
-| Provider | Endpoint | Use Case |
-| -------- | -------- | -------- |
-| `openai` (default) | `/v1/chat/completions` | OpenAI-compatible APIs |
-| `anthropic` | `/v1/messages` | Anthropic-compatible APIs |
-
-```json
-{
-  "models": {
-    "minimax": {
-      "provider": "anthropic",
-      "model_id": "MiniMax-Text-01"
-    }
-  }
-}
-```
-
-### Fallback Chains
-
-When a model request fails (network error, rate limit, server error), the proxy tries the next model in the fallback chain:
-
-```
-Primary model → Fallback 1 → Fallback 2 → ... → Error (all failed)
-```
-
-Each model also has a **circuit breaker** that tracks consecutive failures. After 3 failures, the circuit opens and that model is skipped for 30 seconds, then tested again (half-open state).
-
-## CLI Commands
-
-```
-ogc serve              Start the proxy server
-ogc serve -b          Start in background (detached from terminal)
-ogc serve --port 8080  Start on a custom port
-ogc serve --config /path/to/config.json  Use a custom config
-ogc stop               Stop the running proxy server
-ogc status             Check if the proxy is running
-ogc autostart enable   Enable auto-start on login
-ogc autostart disable  Disable auto-start on login
-ogc autostart status   Check autostart status
-ogc init               Create default configuration file
-ogc validate           Validate configuration file
-ogc models             List configured models
-ogc --version          Show version
-```
-
-## API Endpoints
-
-The proxy exposes these endpoints that Claude Code expects:
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/messages` | Main chat endpoint (Anthropic format) |
-| `POST` | `/v1/messages/count_tokens` | Token counting |
-| `GET` | `/health` | Health check |
-
-## Troubleshooting
-
-### "invalid request body" Error
-
-This means the proxy couldn't parse the request from Claude Code. Enable debug logging to see the raw request:
-
-```json
-{ "logging": { "level": "debug" } }
-```
-
-Or set the environment variable:
-
-```bash
-export OGC_LOG_LEVEL=debug
-```
-
-### "all models failed" Error
-
-All models in the fallback chain returned errors. Check:
-
-1. Your API key is valid: `ogc validate`
-2. You haven't exceeded your backend's usage limits
-3. Your backend is reachable: `curl -H "Authorization: Bearer $OGC_API_KEY" $OGC_OPENAI_BASE`
-
-### Connection Refused
-
-Make sure the proxy is running:
-
-```bash
-ogc status
-```
-
-And Claude Code is pointing to the right address:
-
-```bash
-echo $ANTHROPIC_BASE_URL  # Should be http://127.0.0.1:3456
-```
-
-### Streaming Not Working
-
-The proxy transforms OpenAI SSE to Anthropic SSE in real-time. If streaming appears broken:
-
-1. Set log level to `debug` to see the raw SSE chunks
-2. Check that no proxy or firewall is buffering the connection
-3. Try a non-streaming request first to verify the model works
-
-### Debug Mode
-
-For maximum logging, run with debug level:
-
-```bash
-OGC_LOG_LEVEL=debug ogc serve
-```
-
-This logs:
-
-- Raw Anthropic request body from Claude Code
-- Transformed OpenAI request sent to your backend
-- Raw OpenAI response received
-- SSE stream events during streaming
-
-## Architecture
-
-```
-cmd/ogc/main.go           CLI entry point (cobra commands)
-internal/
-├── config/
-│   ├── config.go               Config types
-│   └── loader.go               JSON loading, env overrides, ${VAR} interpolation
-├── router/
-│   ├── model_router.go         Model selection based on scenario
-│   ├── scenarios.go            Scenario detection (default/think/long_context/background)
-│   └── fallback.go            Fallback handler with circuit breaker
-├── server/
-│   └── server.go               HTTP server setup, graceful shutdown, PID management
-├── handlers/
-│   ├── messages.go             POST /v1/messages handler (streaming + non-streaming)
-│   └── health.go               Health check and token counting endpoints
-├── transformer/
-│   ├── request.go              Anthropic → OpenAI request transformation
-│   ├── response.go             OpenAI → Anthropic response transformation
-│   └── stream.go               Real-time SSE stream transformation
-├── client/
-│   └── opencode.go             HTTP client for the OpenAI-compatible backend
-└── token/
-    └── counter.go              Tiktoken token counter (cl100k_base)
-pkg/types/
-├── anthropic.go                Anthropic API types (polymorphic system/content fields)
-└── openai.go                   OpenAI API types
-configs/
-└── config.example.json         Example configuration
-```
-
-### Key Design Decisions
-
-- **Polymorphic field handling**: Anthropic's `system` and `content` fields accept both strings and arrays. We use `json.RawMessage` with accessor methods (`SystemText()`, `ContentBlocks()`) to handle both formats correctly.
-- **Real-time stream proxying**: SSE events are transformed in-flight, not buffered. This means Claude Code sees responses as they arrive from the backend.
-- **Circuit breaker per model**: Each model gets its own circuit breaker. After 3 consecutive failures, the model is skipped for 30 seconds, then tested again.
-- **Environment variable interpolation**: Config values like `"${OGC_API_KEY}"` are resolved at load time, so you never need to put secrets in the config file.
-
-## Development
-
-```bash
-# Build (version auto-detected from git)
-make build
-
-# Run in development mode
-make run
-
-# Run tests with race detector
 make test
+make build
+```
 
-# Run go vet
-make vet
+生成的程序位于：
 
-# Clean build artifacts
-make clean
+```text
+bin/ogc
+bin/ogc-reasoning-proxy
+```
 
-# Install to $GOPATH/bin
-make install
+构建所有支持的平台：
 
-# Build cross-platform release binaries
+```bash
 make dist
 ```
 
-## Credits
+## 配置和启动
 
-This project is a fork of [ogc](https://github.com/samueltuyizere/ogc) by [samueltuyizere](https://github.com/samueltuyizere). All core ideas, architecture, and original implementation belong to them.
+首次创建配置：
 
-## License
+```bash
+./bin/ogc init
+```
 
-MIT
+配置文件默认位于 `~/.config/ogc/config.json`。启动 OGC：
+
+```bash
+./bin/ogc serve
+```
+
+Claude Code 使用本地端点：
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:3456
+export ANTHROPIC_API_KEY=unused
+claude --dangerously-skip-permissions
+```
+
+打开管理页面：
+
+```text
+http://127.0.0.1:3456/admin/
+```
+
+在 Claude Code 的模型配置中使用 `automodel`，OGC 会根据会话绑定的账号和模型设置选择真实模型。客户端明确传入其他模型名时，OGC 保留该模型名。
+
+## 推理内容兼容代理
+
+部分模型在工具调用后的下一次请求中要求带回上一条回复的 `reasoning_content`。遇到这类错误时，先启动兼容代理：
+
+```bash
+./bin/ogc-reasoning-proxy \
+  -listen 127.0.0.1:3460 \
+  -target https://opencode.ai/zen/go \
+  -cache ~/.config/ogc/reasoning-cache.json
+```
+
+然后把 OGC 的 OpenAI 上游地址配置为：
+
+```text
+http://127.0.0.1:3460/v1
+```
+
+`reasoning-cache.json` 含有会话推理数据，不要提交到 Git。
+
+## 数据与安全
+
+- 账号 Key、会话绑定和推理缓存只保存在本机。
+- 不要把真实 Key、`config.json`、会话文件或推理缓存提交到仓库。
+- 如果设置了 `OGC_API_KEYS` 环境变量，账号由环境变量控制，管理页面不能修改账号配置；需要页面管理时请取消该变量。
+
+## 上游文档
+
+OGC 的基础代理原理、完整配置结构和上游功能请阅读：[xynogen/ogc README](https://github.com/xynogen/ogc/blob/main/README.md)。
