@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type sessionKey struct{}
@@ -19,6 +20,17 @@ func setSessionHeaders(r *http.Request) {
 		r.Header.Set("x-opencode-session", id)
 	}
 	r.Header.Set("User-Agent", "ogc/session-fix-1")
+}
+
+// resetUpstreamSession keeps OGC's local binding intact while replacing an
+// upstream session that has started returning a transient 401. The request
+// body contains the full conversation, so upstream continuity is preserved.
+func resetUpstreamSession(r *http.Request) {
+	id := r.Header.Get("x-opencode-session")
+	if id == "" {
+		id = "ogc"
+	}
+	r.Header.Set("x-opencode-session", id+"-reset-"+time.Now().UTC().Format("20060102T150405.000000000"))
 }
 
 // SessionID prefers Claude's persistent identity over launcher-generated headers.
