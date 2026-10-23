@@ -74,25 +74,41 @@ func (c *Client) ChatCompletion(
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.BaseURL, bytes.NewReader(body))
+	buildRequest := func(resetSession bool) (*http.Request, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.BaseURL, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+		setSessionHeaders(httpReq)
+		if resetSession {
+			resetUpstreamSession(httpReq)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+endpoint.APIKey)
+		if req.Stream != nil && *req.Stream {
+			httpReq.Header.Set("Accept", "text/event-stream")
+		}
+		return httpReq, nil
+	}
+
+	httpReq, err := buildRequest(false)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, err
 	}
-
-	setSessionHeaders(httpReq)
-
-	// Set headers
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+endpoint.APIKey)
-
-	// Add streaming header if requested
-	if req.Stream != nil && *req.Stream {
-		httpReq.Header.Set("Accept", "text/event-stream")
-	}
-
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		resp.Body.Close()
+		httpReq, err = buildRequest(true)
+		if err != nil {
+			return nil, err
+		}
+		resp, err = c.httpClient.Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("request failed after upstream session reset: %w", err)
+		}
 	}
 
 	// Check for error status codes
@@ -172,26 +188,42 @@ func (c *Client) SendAnthropicRequest(
 ) (*http.Response, error) {
 	endpoint := c.anthropicConfig
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.BaseURL, bytes.NewReader(body))
+	buildRequest := func(resetSession bool) (*http.Request, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.BaseURL, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+		setSessionHeaders(httpReq)
+		if resetSession {
+			resetUpstreamSession(httpReq)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("x-api-key", endpoint.APIKey)
+		httpReq.Header.Set("anthropic-version", "2023-06-01")
+		if stream {
+			httpReq.Header.Set("Accept", "text/event-stream")
+		}
+		return httpReq, nil
+	}
+
+	httpReq, err := buildRequest(false)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, err
 	}
-
-	setSessionHeaders(httpReq)
-
-	// Set headers - x-api-key is required for OpenCode Go's /v1/messages endpoint
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", endpoint.APIKey)
-	httpReq.Header.Set("anthropic-version", "2023-06-01")
-
-	// Add streaming header if requested
-	if stream {
-		httpReq.Header.Set("Accept", "text/event-stream")
-	}
-
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		resp.Body.Close()
+		httpReq, err = buildRequest(true)
+		if err != nil {
+			return nil, err
+		}
+		resp, err = c.httpClient.Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("request failed after upstream session reset: %w", err)
+		}
 	}
 
 	// Check for error status codes
