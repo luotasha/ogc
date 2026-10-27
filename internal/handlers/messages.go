@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xynogen/ogc/internal/client"
@@ -42,10 +43,17 @@ type MessagesHandler struct {
 // responseWriter wraps http.ResponseWriter to track if headers were written.
 type responseWriter struct {
 	http.ResponseWriter
+	mu          sync.Mutex
 	wroteHeader bool
 }
 
 func (w *responseWriter) WriteHeader(code int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.writeHeaderLocked(code)
+}
+
+func (w *responseWriter) writeHeaderLocked(code int) {
 	if !w.wroteHeader {
 		w.wroteHeader = true
 		w.ResponseWriter.WriteHeader(code)
@@ -53,17 +61,42 @@ func (w *responseWriter) WriteHeader(code int) {
 }
 
 func (w *responseWriter) Write(b []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if !w.wroteHeader {
-		w.WriteHeader(http.StatusOK)
+		w.writeHeaderLocked(http.StatusOK)
 	}
 	return w.ResponseWriter.Write(b)
 }
 
 // Flush implements http.Flusher for SSE streaming support.
 func (w *responseWriter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// WriteAndFlush keeps an entire SSE frame together when multiple goroutines
+// share the response (for example, upstream events and heartbeat comments).
+func (w *responseWriter) WriteAndFlush(b []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.wroteHeader {
+		w.writeHeaderLocked(http.StatusOK)
+	}
+	n, err := w.ResponseWriter.Write(b)
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+	return n, err
+}
+
+func (w *responseWriter) HeaderWritten() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.wroteHeader
 }
 
 // NewMessagesHandler creates a new messages handler.
@@ -209,9 +242,7 @@ func (h *MessagesHandler) handleStreaming(
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	rw.WriteHeader(http.StatusOK)
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
+	rw.Flush()
 
 	// Start heartbeat to keep connection alive while waiting for upstream.
 	// Claude Code times out after ~6 seconds of no data, so we send pings every 3 seconds
@@ -225,9 +256,9 @@ func (h *MessagesHandler) handleStreaming(
 			select {
 			case <-ticker.C:
 				// Send SSE comment (ignored by client but keeps connection alive)
-				fmt.Fprintf(w, ":keepalive\n\n")
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
+				if _, err := rw.WriteAndFlush([]byte(":keepalive\n\n")); err != nil {
+					h.logger.Debug("heartbeat write failed", "error", err)
+					return
 				}
 			case <-heartbeatDone:
 				return
@@ -325,7 +356,7 @@ func (h *MessagesHandler) handleStreaming(
 
 	// All models failed
 	h.metrics.RecordFailure()
-	if !rw.wroteHeader {
+	if !rw.HeaderWritten() {
 		h.sendError(w, http.StatusBadGateway, "all streaming models failed", nil)
 	} else {
 		// Headers already sent - send error as SSE event
@@ -597,7 +628,7 @@ func (h *MessagesHandler) sendError(w http.ResponseWriter, statusCode int, messa
 	)
 
 	// Use the wrapped writer if available to prevent duplicate WriteHeader calls
-	if rw, ok := w.(*responseWriter); ok && rw.wroteHeader {
+	if rw, ok := w.(*responseWriter); ok && rw.HeaderWritten() {
 		return
 	}
 
