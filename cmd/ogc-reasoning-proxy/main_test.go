@@ -2,11 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCaptureAndPatchNonStreaming(t *testing.T) {
@@ -110,9 +112,28 @@ func TestStreamCompleteLine(t *testing.T) {
 func TestCachePersists(t *testing.T) {
 	p := testProxy(t)
 	p.cache.put([]string{"call_3"}, "secret reasoning")
-	loaded := loadCache(p.cache.path)
+	if err := p.cache.flush(); err != nil {
+		t.Fatal(err)
+	}
+	loaded := loadCache(p.cache.path, defaultCacheTTL, defaultCacheMaxEntries, time.Hour)
+	defer loaded.close()
 	if got, ok := loaded.get([]string{"call_3"}); !ok || got != "secret reasoning" {
 		t.Fatalf("cache missing: %q %v", got, ok)
+	}
+}
+
+func TestCacheEnforcesMaxEntriesInBatches(t *testing.T) {
+	dir := t.TempDir()
+	c := loadCache(filepath.Join(dir, "cache.json"), defaultCacheTTL, 10, time.Hour)
+	defer c.close()
+	for i := 0; i < 11; i++ {
+		c.put([]string{fmt.Sprintf("call_%02d", i)}, "reasoning")
+		time.Sleep(time.Millisecond)
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.entries) != 9 {
+		t.Fatalf("expected batched prune to 9 entries, got %d", len(c.entries))
 	}
 }
 
@@ -121,5 +142,7 @@ func testProxy(t *testing.T) *proxy {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "cache.json")
 	t.Cleanup(func() { _ = os.Remove(path) })
-	return &proxy{cache: loadCache(path)}
+	cache := loadCache(path, defaultCacheTTL, defaultCacheMaxEntries, time.Hour)
+	t.Cleanup(cache.close)
+	return &proxy{cache: cache}
 }

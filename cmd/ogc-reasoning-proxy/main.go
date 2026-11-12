@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,10 +12,22 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+)
+
+const (
+	defaultCacheTTL           = 30 * 24 * time.Hour
+	defaultCacheMaxEntries    = 30000
+	defaultCacheFlushInterval = 30 * time.Second
+	cacheTouchInterval        = time.Hour
+	defaultMemoryLimitMiB     = 512
 )
 
 type cacheEntry struct {
@@ -23,30 +36,74 @@ type cacheEntry struct {
 }
 
 type reasoningCache struct {
-	mu      sync.RWMutex
-	path    string
-	entries map[string]cacheEntry
+	mu            sync.RWMutex
+	path          string
+	entries       map[string]cacheEntry
+	ttl           time.Duration
+	maxEntries    int
+	flushInterval time.Duration
+	dirty         bool
+	version       uint64
+	stop          chan struct{}
+	done          chan struct{}
 }
 
-func loadCache(path string) *reasoningCache {
-	c := &reasoningCache{path: path, entries: map[string]cacheEntry{}}
-	b, err := os.ReadFile(path)
-	if err == nil {
-		_ = json.Unmarshal(b, &c.entries)
+func loadCache(path string, ttl time.Duration, maxEntries int, flushInterval time.Duration) *reasoningCache {
+	c := &reasoningCache{
+		path:          path,
+		entries:       map[string]cacheEntry{},
+		ttl:           ttl,
+		maxEntries:    maxEntries,
+		flushInterval: flushInterval,
+		stop:          make(chan struct{}),
+		done:          make(chan struct{}),
 	}
-	c.pruneLocked(time.Now().Add(-30 * 24 * time.Hour).UnixMilli())
+	if f, err := os.Open(path); err == nil {
+		if err := json.NewDecoder(bufio.NewReaderSize(f, 256*1024)).Decode(&c.entries); err != nil {
+			log.Printf("load reasoning cache: %v", err)
+		}
+		_ = f.Close()
+	}
+	loaded := len(c.entries)
+	c.pruneLocked(time.Now().Add(-c.ttl).UnixMilli())
+	c.enforceLimitLocked()
+	if len(c.entries) < loaded {
+		c.compactLocked()
+		debug.FreeOSMemory()
+	}
+	log.Printf("loaded reasoning cache: entries=%d pruned=%d", len(c.entries), loaded-len(c.entries))
+	go c.flushLoop()
 	return c
 }
 
 func (c *reasoningCache) get(ids []string) (string, bool) {
+	now := time.Now().UnixMilli()
 	c.mu.RLock()
-	defer c.mu.RUnlock()
 	for _, id := range ids {
 		if e, ok := c.entries[id]; ok && e.Reasoning != "" {
-			return e.Reasoning, true
+			reasoning := e.Reasoning
+			stale := e.LastSeen < now-cacheTouchInterval.Milliseconds()
+			c.mu.RUnlock()
+			if stale {
+				c.touch(id, now)
+			}
+			return reasoning, true
 		}
 	}
+	c.mu.RUnlock()
 	return "", false
+}
+
+func (c *reasoningCache) touch(id string, now int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[id]
+	if !ok || e.LastSeen >= now-cacheTouchInterval.Milliseconds() {
+		return
+	}
+	e.LastSeen = now
+	c.entries[id] = e
+	c.markDirtyLocked()
 }
 
 func (c *reasoningCache) put(ids []string, reasoning string) {
@@ -61,43 +118,165 @@ func (c *reasoningCache) put(ids []string, reasoning string) {
 		if id == "" {
 			continue
 		}
-		if old, ok := c.entries[id]; !ok || old.Reasoning != reasoning {
+		old, ok := c.entries[id]
+		if !ok || old.Reasoning != reasoning || old.LastSeen < now-cacheTouchInterval.Milliseconds() {
 			c.entries[id] = cacheEntry{Reasoning: reasoning, LastSeen: now}
 			changed = true
 		}
 	}
 	if changed {
-		c.pruneLocked(time.Now().Add(-30 * 24 * time.Hour).UnixMilli())
-		if err := c.persistLocked(); err != nil {
-			log.Printf("persist reasoning cache: %v", err)
-		}
+		c.pruneLocked(time.Now().Add(-c.ttl).UnixMilli())
+		c.enforceLimitLocked()
+		c.markDirtyLocked()
 	}
+}
+
+func (c *reasoningCache) markDirtyLocked() {
+	c.dirty = true
+	c.version++
 }
 
 func (c *reasoningCache) pruneLocked(cutoff int64) {
 	for id, e := range c.entries {
 		if e.LastSeen < cutoff {
 			delete(c.entries, id)
+			c.markDirtyLocked()
 		}
 	}
 }
 
-func (c *reasoningCache) persistLocked() error {
-	if err := os.MkdirAll(filepath.Dir(c.path), 0700); err != nil {
-		return err
+func (c *reasoningCache) enforceLimitLocked() {
+	if c.maxEntries <= 0 || len(c.entries) <= c.maxEntries {
+		return
 	}
-	b, err := json.Marshal(c.entries)
-	if err != nil {
+	type candidate struct {
+		id       string
+		lastSeen int64
+	}
+	items := make([]candidate, 0, len(c.entries))
+	for id, e := range c.entries {
+		items = append(items, candidate{id: id, lastSeen: e.LastSeen})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].lastSeen < items[j].lastSeen })
+	// Remove a batch so the expensive ordering is not repeated on every insert.
+	target := c.maxEntries * 9 / 10
+	if target < 1 {
+		target = 1
+	}
+	for i := 0; len(c.entries) > target && i < len(items); i++ {
+		delete(c.entries, items[i].id)
+	}
+	c.markDirtyLocked()
+}
+
+func (c *reasoningCache) compactLocked() {
+	compact := make(map[string]cacheEntry, len(c.entries))
+	for id, entry := range c.entries {
+		compact[id] = entry
+	}
+	c.entries = compact
+}
+
+func (c *reasoningCache) flushLoop() {
+	defer close(c.done)
+	ticker := time.NewTicker(c.flushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := c.flush(); err != nil {
+				log.Printf("persist reasoning cache: %v", err)
+			}
+		case <-c.stop:
+			if err := c.flush(); err != nil {
+				log.Printf("persist reasoning cache during shutdown: %v", err)
+			}
+			return
+		}
+	}
+}
+
+func (c *reasoningCache) close() {
+	close(c.stop)
+	<-c.done
+}
+
+func (c *reasoningCache) flush() error {
+	c.mu.RLock()
+	if !c.dirty {
+		c.mu.RUnlock()
+		return nil
+	}
+	version := c.version
+	if err := os.MkdirAll(filepath.Dir(c.path), 0700); err != nil {
+		c.mu.RUnlock()
 		return err
 	}
 	tmp := c.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		c.mu.RUnlock()
 		return err
 	}
-	if err := os.Chmod(tmp, 0600); err != nil {
+	w := bufio.NewWriterSize(f, 256*1024)
+	writeErr := c.writeJSONLocked(w)
+	if writeErr == nil {
+		writeErr = w.Flush()
+	}
+	if closeErr := f.Close(); writeErr == nil {
+		writeErr = closeErr
+	}
+	c.mu.RUnlock()
+	if writeErr != nil {
+		_ = os.Remove(tmp)
+		return writeErr
+	}
+	if err := os.Rename(tmp, c.path); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, c.path)
+	c.mu.Lock()
+	if c.version == version {
+		c.dirty = false
+	}
+	count := len(c.entries)
+	c.mu.Unlock()
+	log.Printf("persisted reasoning cache: entries=%d", count)
+	return nil
+}
+
+func (c *reasoningCache) writeJSONLocked(w io.Writer) error {
+	if _, err := io.WriteString(w, "{"); err != nil {
+		return err
+	}
+	first := true
+	for id, entry := range c.entries {
+		key, err := json.Marshal(id)
+		if err != nil {
+			return err
+		}
+		value, err := json.Marshal(entry)
+		if err != nil {
+			return err
+		}
+		if !first {
+			if _, err := io.WriteString(w, ","); err != nil {
+				return err
+			}
+		}
+		first = false
+		if _, err := w.Write(key); err != nil {
+			return err
+		}
+		if _, err := io.WriteString(w, ":"); err != nil {
+			return err
+		}
+		if _, err := w.Write(value); err != nil {
+			return err
+		}
+	}
+	_, err := io.WriteString(w, "}")
+	return err
 }
 
 type proxy struct {
@@ -383,18 +562,41 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:3460", "listen address")
 	targetRaw := flag.String("target", "https://opencode.ai/zen/go", "upstream URL prefix")
 	cachePath := flag.String("cache", "reasoning-cache.json", "cache file")
+	cacheTTL := flag.Duration("cache-ttl", defaultCacheTTL, "maximum age of unused cache entries")
+	cacheMaxEntries := flag.Int("cache-max-entries", defaultCacheMaxEntries, "maximum reasoning cache entries")
+	cacheFlushInterval := flag.Duration("cache-flush-interval", defaultCacheFlushInterval, "interval for batching cache writes")
+	memoryLimitMiB := flag.Int64("memory-limit-mib", defaultMemoryLimitMiB, "Go soft memory limit in MiB (0 disables)")
 	flag.Parse()
+	if *memoryLimitMiB > 0 {
+		debug.SetMemoryLimit(*memoryLimitMiB << 20)
+	}
 	target, err := url.Parse(*targetRaw)
 	if err != nil {
 		log.Fatal(err)
 	}
+	cache := loadCache(*cachePath, *cacheTTL, *cacheMaxEntries, *cacheFlushInterval)
+	defer cache.close()
 	p := &proxy{
 		target: target,
 		client: &http.Client{Timeout: 5 * time.Minute},
-		cache:  loadCache(*cachePath),
+		cache:  cache,
 	}
 	log.Printf("reasoning compatibility proxy listening on %s -> %s", *listen, target)
-	if err := http.ListenAndServe(*listen, p); err != nil {
-		log.Fatal(fmt.Errorf("serve: %w", err))
+	server := &http.Server{Addr: *listen, Handler: p}
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.ListenAndServe() }()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	select {
+	case err := <-errCh:
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatal(fmt.Errorf("serve: %w", err))
+		}
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("shutdown server: %v", err)
+		}
 	}
 }
